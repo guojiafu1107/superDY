@@ -1,0 +1,385 @@
+
+
+---
+
+# SuperDY Web应用 系统开发文档 V1.0
+
+| 文档版本 | 修改日期 | 修改人 | 修改说明 |
+|---------|---------|--------|---------|
+| V1.0 | 2026-04-25 | 架构组 | Phase 1 初版技术方案 |
+
+## 一、项目概述
+
+### 1.1 项目背景
+SuperDY是面向抖音创作者的一站式AI增长工作台，覆盖热点发现、AI脚本创作、算法预估、智能排期与数据分析全链路。本文档定义Web端Phase 1（MVP）至Phase 2的技术架构与实现规范。
+
+### 1.2 技术目标
+- 首屏加载 ≤ 2s，API响应 P95 ≤ 200ms（非AI类）
+- 支持5000并发用户，系统可水平扩展
+- AI服务独立部署，推理延迟 P95 ≤ 5s（脚本生成场景）
+- 视频文件安全上传，支持断点续传，单文件上限1GB
+
+---
+
+## 二、技术选型
+
+| 层次 | 技术栈 | 选型理由 |
+|------|--------|---------|
+| 前端框架 | React 18 + Next.js 14 (App Router) | SSR首屏快，SEO友好，生态丰富 |
+| UI组件库 | Ant Design 5 + Tailwind CSS 3 | 数据密集型界面高效搭建 + 原子化样式灵活定制 |
+| 状态管理 | Zustand + React Query (TanStack Query) | 轻量客户端状态 + 服务端缓存同步 |
+| 图表可视化 | ECharts 5 + D3.js（完播率曲线等复杂图） | 大数据量图表高性能渲染 |
+| 后端框架 | Go (Gin) 微服务 + Python FastAPI (AI服务) | Go高并发稳，Python生态适合AI |
+| 数据库 | PostgreSQL 15 (主库) + Redis 7 (缓存/队列) | 主库强事务，Redis扛热数据高并发 |
+| 消息队列 | Apache Kafka | 解耦AI推理、数据同步、埋点上报长链路 |
+| 对象存储 | 阿里云OSS / AWS S3 | 视频素材与导出文件存储 |
+| 搜索引擎 | Elasticsearch 8 | 灵感素材、脚本全文检索 |
+| AI模型 | 自研Triton Inference Server部署 | 统一模型版本管理与GPU调度 |
+| 容器编排 | Kubernetes | 微服务弹性伸缩 |
+| CI/CD | GitHub Actions + ArgoCD | 自动化构建与GitOps部署 |
+| 监控 | Prometheus + Grafana + Loki | 指标/日志/链路追踪统一，SkyWalking做APM |
+
+---
+
+## 三、系统架构
+
+### 3.1 架构图（逻辑描述）
+
+```
+客户端 (Browser)
+  │
+  ├─ CDN (静态资源 + 视频缩略图)
+  │
+  └─ API Gateway (Nginx/Kong) ─── 鉴权 (JWT)
+        │
+        ├── Web BFF (Go Gin) ─── 聚合后端各服务，一接口返回页面全量数据
+        │     ├─ Redis (用户Session + 热点榜单缓存)
+        │     └─ PostgreSQL (读库)
+        │
+        ├── 用户服务 (Go)
+        ├── 内容服务 (Go)        ←→ PostgreSQL + Elasticsearch
+        ├── 数据分析服务 (Go)    ←→ ClickHouse (埋点数据)
+        ├── 发布调度服务 (Go)    ←→ Kafka + Redis (定时任务锁)
+        ├── 通知服务 (Go)        ←→ Kafka (消费事件)
+        │
+        └── AI服务集群 (Python FastAPI)
+              ├─ 脚本生成模型
+              ├─ 风格迁移模型
+              ├─ 视频分析模型（算法预估）
+              └─ NLP服务（标题/标签生成）
+```
+
+### 3.2 核心数据流——脚本生成链路
+
+```
+用户输入主题 → BFF → 内容服务 → Kafka(AI任务) → AI服务推理
+                                                      ↓
+用户Polling结果 ← BFF ← Kafka(结果回调) ← 结果入库+通知 ←
+```
+
+- 异步解耦：长耗时AI任务异步处理，BFF提交后立即返回task_id，前端轮询或WebSocket推送完成状态。
+
+---
+
+## 四、模块与接口设计
+
+### 4.1 用户与鉴权模块
+
+| 接口 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 抖音OAuth授权跳转 | GET | `/api/v1/auth/douyin` | 302至抖音授权页 |
+| OAuth回调 | GET | `/api/v1/auth/douyin/callback` | code换token，存refresh_token |
+| 获取当前用户信息 | GET | `/api/v1/users/me` | 头像、昵称、订阅状态 |
+| 刷新Token | POST | `/api/v1/auth/refresh` | 抖音refresh_token续期 |
+| 绑定第二账号 | POST | `/api/v1/users/accounts` | 多账号关联 |
+
+**鉴权方案**：所有API Header带 `Authorization: Bearer <JWT>`，网关统一验签，JWT含user_id与plan_type。
+
+### 4.2 热点灵感引擎
+
+| 接口 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 热点榜单 | GET | `/api/v1/trends/hot` | 实时榜单，参数category, limit, offset |
+| 订阅领域热点 | GET | `/api/v1/trends/subscribed` | 用户订阅标签的聚合热点流 |
+| 视频拆解 | POST | `/api/v1/trends/analyze` | Body: `{share_url}` → 返回拆解结果task_id |
+| 拆解结果查询 | GET | `/api/v1/trends/analyze/{task_id}` | 轮询AI拆解完成状态 |
+| 灵感收藏夹 | CRUD | `/api/v1/inspirations` | 增删改查灵感素材 |
+| 搜索素材 | GET | `/api/v1/inspirations/search` | q, tags, date_range → ES全文检索 |
+
+**缓存策略**：热点榜单 Redis 缓存30分钟，拆解结果CDN缓存缩略图（阿里云OSS+CDN）。
+
+### 4.3 AI智能创作工坊
+
+| 接口 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 抓取历史风格 | POST | `/api/v1/style/analyze` | 授权后抓最近50条视频文案训练 |
+| 获取风格档案 | GET | `/api/v1/style/profile` | 可视化风格标签 |
+| 生成脚本 | POST | `/api/v1/scripts/generate` | Body: `{topic, duration, tone, use_web_search}` → task_id |
+| 获取脚本结果 | GET | `/api/v1/scripts/{script_id}` | 含多个版本 |
+| 多版本改写 | POST | `/api/v1/scripts/{script_id}/variants` | 生成3个变体 |
+| 生成标题/标签 | POST | `/api/v1/scripts/{script_id}/titles` | 返回10个候选标题+话题标签 |
+| 导出剪辑指引 | GET | `/api/v1/scripts/{script_id}/export` | 返回PDF或结构化JSON |
+
+**AI任务状态机**：`pending → processing → completed / failed`，失败时返回error_code供前端重试。
+
+### 4.4 算法预估与A/B测试（Phase 2）
+
+| 接口 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 上传视频草稿 | POST | `/api/v1/evaluate/upload` | multipart/form-data，最大1GB |
+| 预审评分 | POST | `/api/v1/evaluate/score` | Body含视频ID/脚本 → task_id |
+| A/B版本对比 | POST | `/api/v1/evaluate/compare` | Body含2-4个版本ID |
+| 获取预估结果 | GET | `/api/v1/evaluate/{task_id}` | 各维度评分+风险点 |
+
+### 4.5 智能发布与排期
+
+| 接口 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 创建发布任务 | POST | `/api/v1/publish/tasks` | 视频+标题+时间+话题 |
+| 日历视图 | GET | `/api/v1/publish/calendar` | `?month=2026-04` |
+| 最佳时间推荐 | GET | `/api/v1/publish/best-time` | 基于账号历史推荐未来48h窗口 |
+| 自动化规则CRUD | CRUD | `/api/v1/automations` | 条件-动作规则管理 |
+| 发布后实时数据 | GET | `/api/v1/publish/{task_id}/live-stats` | SSE推送或Polling，24小时实时 |
+
+### 4.6 深度数据洞察
+
+| 接口 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 仪表盘概览 | GET | `/api/v1/analytics/dashboard` | 粉丝/播放/互动总览 |
+| 粉丝画像 | GET | `/api/v1/analytics/audience` | 年龄性别地域兴趣 |
+| 单视频复盘 | GET | `/api/v1/analytics/videos/{video_id}` | 完播率曲线+来源+词云 |
+| 竞品列表 | GET | `/api/v1/competitors` | 监控账号列表 |
+| 竞品分析 | GET | `/api/v1/competitors/{id}/report` | 近7天对比数据 |
+| 直播实时看板 | GET | `/api/v1/live/{room_id}/realtime` | WebSocket推送，场观/GMV等 |
+| 直播复盘 | GET | `/api/v1/live/{room_id}/review` | 直播结束后自动生成报告 |
+
+---
+
+## 五、数据模型设计
+
+### 5.1 核心表结构（PostgreSQL）
+
+**users**
+```sql
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    douyin_open_id VARCHAR(128) UNIQUE NOT NULL,  -- 抖音唯一ID
+    union_id VARCHAR(128),                         -- 抖音开放平台union_id，跨应用关联
+    nickname VARCHAR(64),
+    avatar_url TEXT,
+    plan_type VARCHAR(16) DEFAULT 'free',          -- free/pro/team
+    subscription_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**user_accounts**（多账号绑定）
+```sql
+CREATE TABLE user_accounts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    douyin_account_id VARCHAR(128),               -- 绑定的抖音账号ID
+    account_nickname VARCHAR(64),
+    access_token TEXT,                             -- 加密存储
+    refresh_token TEXT,
+    token_expires_at TIMESTAMPTZ,
+    followers_count INT DEFAULT 0,                -- 粉丝数快照，定时更新
+    is_primary BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**scripts**
+```sql
+CREATE TABLE scripts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    account_id UUID REFERENCES user_accounts(id),
+    inspiration_id UUID REFERENCES inspirations(id), -- 来源灵感
+    topic VARCHAR(255),                              -- 主题/标题
+    duration INT,                                    -- 目标秒数
+    tone VARCHAR(32),                                -- 情绪基调
+    content JSONB NOT NULL,                          -- 结构化脚本内容
+    variants JSONB,                                  -- 多版本改写数组
+    titles JSONB,                                    -- 候选标题
+    hashtags JSONB,                                  -- 推荐话题标签
+    status VARCHAR(16) DEFAULT 'draft',              -- draft/complete/archived
+    ai_task_id VARCHAR(64),                          -- 追踪AI推理任务
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**publish_tasks**
+```sql
+CREATE TABLE publish_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    account_id UUID REFERENCES user_accounts(id),
+    script_id UUID REFERENCES scripts(id),
+    video_url TEXT,                                  -- 已上传视频OSS地址
+    title VARCHAR(255),
+    hashtags TEXT[],
+    scheduled_at TIMESTAMPTZ,                        -- 拟发布时间
+    published_at TIMESTAMPTZ,                        -- 实际发布时间
+    douyin_video_id VARCHAR(64),                     -- 发布后抖音返回ID
+    status VARCHAR(16) DEFAULT 'pending',            -- pending/published/failed/paused
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**video_analytics**（单视频数据快照，T+1更新）
+```sql
+CREATE TABLE video_analytics (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    video_id UUID NOT NULL,                          -- 关联publish_tasks或抖音video id
+    account_id UUID REFERENCES user_accounts(id),
+    snapshot_date DATE,                              -- 数据日期
+    play_count BIGINT DEFAULT 0,
+    like_count BIGINT DEFAULT 0,
+    comment_count BIGINT DEFAULT 0,
+    share_count BIGINT DEFAULT 0,
+    completion_rate_curve JSONB,                     -- [{second: 1, rate: 0.95}, ...]
+    traffic_sources JSONB,                           -- {recommend: 60, search: 15, profile: 10...}
+    audience_profile JSONB,                          -- {age: {}, gender: {}, city: {}}
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 5.2 Redis 缓存设计
+
+| Key模式 | 类型 | TTL | 说明 |
+|--------|------|-----|------|
+| `hot:trends:{category}` | ZSET | 30min | 热点榜按热度排序 |
+| `user:{id}:style_profile` | STRING(JSON) | 24h | 用户风格档案 |
+| `session:{token}` | STRING | 7d | JWT黑名单/白名单 |
+| `rate_limit:{ip}:{api}` | INT | 60s | API限流计数器 |
+| `ai_task:{task_id}` | STRING(JSON) | 1h | AI任务状态 |
+
+---
+
+## 六、AI服务设计
+
+### 6.1 模型清单
+
+| 模型名称 | 功能 | 框架 | GPU需求 | 推理延迟目标 |
+|---------|------|------|---------|------------|
+| script-gen-v1 | 脚本生成 | 自研LLM (基于开源基座微调) | A10G × 2 | P95 < 5s |
+| style-extract-v1 | 风格提取 | BERT-base微调 | T4 | P95 < 1s |
+| video-analyzer-v1 | 视频拆解（多模态） | VideoMAE + CLIP | A10G | P95 < 30s |
+| score-estimator-v1 | 算法预估 | XGBoost + 特征工程 | CPU | P95 < 3s |
+| title-gen-v1 | 标题标签生成 | T5-small微调 | T4 | P95 < 2s |
+
+### 6.2 推理服务部署
+
+- **Triton Inference Server** 统一管理模型版本（支持蓝绿发布）。
+- **GPU池化**：Kubernetes + GPU Operator，按模型类型划分A10G/T4节点组。
+- **弹性扩容**：HPA基于Kafka消费延迟自动扩AI Pod副本数（触发阈值：Lag > 50）。
+
+### 6.3 安全与内容审核
+
+- **输入过滤**：敏感词库 + 正则阻断。
+- **输出检测**：生成文本过阿里绿网/网易易盾API，高风险内容自动回退并标记。
+- **人工复核队列**：边缘模糊内容进入PostgreSQL审核表，运营后台定期处理。
+
+---
+
+## 七、非功能需求实现
+
+### 7.1 性能优化
+- **前端**：Next.js SSG/ISR首页灵感看板；视频缩略图WebP + CDN；ECharts按需加载。
+- **后端**：热点榜单Redis ZSET + 定时30分钟快照刷入Redis，无DB穿透；数据分析走ClickHouse OLAP，不查主库；API聚合BFF层并行调用下游 + 超时熔断（Hystrix-Go）。
+- **视频上传**：前端分片上传（每片5MB），后端组装；Redis记录分片进度，支持断点续传。
+
+### 7.2 安全
+- **数据传输**：全站HTTPS，API强制TLS 1.3。
+- **令牌存储**：抖音access_token AES-256-GCM加密入库；密钥走KMS管理。
+- **防刷**：API网关层IP限流 + 用户级令牌桶限流；AI接口按Plan Type分级配额。
+- **数据隔离**：多租户物理级隔离（按user_id分库分表预留）；脚本内容按创建者隔离查询，接口强制校验user_id。
+
+### 7.3 可观测性
+- **指标**：Prometheus采集API延迟/QPS/错误率、AI任务队列深度、Redis命中率。
+- **日志**：结构化JSON日志 → Filebeat → Elasticsearch → Kibana，保留30天。
+- **链路追踪**：SkyWalking探针，Go/Python服务全链路trace_id透传。
+
+---
+
+## 八、部署架构与CI/CD
+
+### 8.1 环境规划
+
+| 环境 | 用途 | 配置 |
+|------|------|------|
+| dev | 日常开发联调 | 单副本，1C2G |
+| staging | 预发验证 | 双副本，2C4G，与抖音沙箱环境对接 |
+| prod | 生产 | 区域双活，每服务≥3副本，4C8G起 |
+
+### 8.2 CI/CD流水线
+1. 代码push → GitHub Actions触发单元测试 + 代码扫描（SonarQube）
+2. 构建Docker镜像，推送到Harbor仓库，标签=git commit hash
+3. 更新K8s部署清单 → ArgoCD自动同步至staging集群
+4. E2E自动化测试通过后，手动审批 → ArgoCD同步至prod集群
+
+---
+
+## 九、开发规范
+
+### 9.1 分支策略
+- `main`：生产就绪分支，只能通过PR合并。
+- `develop`：开发主分支。
+- `feature/<module>-<desc>`：功能分支。
+- `hotfix/<issue-id>`：紧急修复分支。
+
+### 9.2 API设计规范
+- RESTful风格，路径为名词复数：`/api/v1/scripts`。
+- 分页统一格式 `{ data: [...], total: 100, page: 1, page_size: 20 }`。
+- 错误码体系：
+
+| Code | 说明 | 示例消息 |
+|------|------|---------|
+| 0 | 成功 | ok |
+| 40001 | 参数错误 | invalid duration |
+| 40100 | 未授权 | token expired |
+| 40300 | 无权限 | pro plan required |
+| 42900 | 频率限制 | too many AI requests |
+| 50000 | 服务错误 | internal error, retry later |
+| 50010 | AI服务超时 | script gen timeout |
+
+### 9.3 数据库规范
+- 表名：小写 + 下划线，单数（`user_accounts`）。
+- 核心表必备字段：`id, created_at, updated_at`。
+- JSONB字段存储半结构化数据（脚本内容、变体），非核心查询字段剥离。
+- 生产禁止 `DROP TABLE` 等破坏性DDL，变更一律走Liquibase/Flyway Migration。
+
+---
+
+## 十、风险与应对
+
+| 风险 | 可能性 | 影响 | 应对策略 |
+|------|--------|------|---------|
+| 抖音API限流/变更 | 中 | 高 | API调用本地缓存兜底；网关层熔断 + 降级开关；定期关注抖音开放平台公告 |
+| AI推理延迟超预期 | 高 | 中 | 异步任务+轮询模式；前台先行返回Skeleton屏；模型量化优化；GPU弹性扩容 |
+| 视频拆解版权风险 | 低 | 高 | 仅存储公开视频元数据与公开截图帧链接，不存储他人视频文件；用户协议明确使用声明 |
+| 多租户数据泄露 | 低 | 极高 | 接口强制user_id隔离校验，SQL层全部WHERE user_id = ?；定期第三方渗透测试 |
+| 5066年抖音推荐算法重大改版 | 低 | 中 | 算法预估模型预留特征权重调节接口，支持快速调整；监控预估准确率偏离值并预警 |
+
+---
+
+## 十一、附录
+
+### 11.1 接口路径速查表
+| 模块 | 路径前缀 |
+|------|---------|
+| 用户/鉴权 | `/api/v1/auth`, `/api/v1/users` |
+| 灵感引擎 | `/api/v1/trends`, `/api/v1/inspirations` |
+| 创作工坊 | `/api/v1/style`, `/api/v1/scripts` |
+| 算法预估 | `/api/v1/evaluate` |
+| 发布排期 | `/api/v1/publish`, `/api/v1/automations` |
+| 数据分析 | `/api/v1/analytics`, `/api/v1/competitors`, `/api/v1/live` |
+
+### 11.2 参考技术文档
+- 抖音开放平台：https://developer.open-douyin.com
+- Triton Inference Server：https://developer.nvidia.com/triton-inference-server
+- PostgreSQL 15官方文档：https://www.postgresql.org/docs/15/
+
+---
+
